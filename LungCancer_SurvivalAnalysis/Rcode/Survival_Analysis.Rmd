@@ -1,0 +1,278 @@
+---
+title: "Survival_Analysis"
+author: "Me"
+date: "2023-11-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Survival analysis of a lung disease:
+
+If you have to do survival analysis after a disease is detected, you're not interested in survival time per say. You're interested in what influences the survival time. So you want to know if survival time depends on one or more factors called predictors.
+
+1.  If its only one factor with binary outcomes, Log-rank test can be used.
+2.  If you want to study two or more, use Cox proportional hazards survival regression. The regression assesses the effect of each predictor on the shape of the survival curve.
+
+```{r}
+
+library(readxl)
+
+library(writexl)
+xlsx_file <- "veteran.xlsx"
+
+# Read the .xlsx file into a data frame
+data <- read_excel(xlsx_file)
+
+# Assign column names to the data frame
+colnames(data) <- c("Treatment", "Celltype", "time","Status","K_score","Diag","Age","Prior_T")  # Replace with your column names
+write_xlsx(data, path = "veteran.xlsx")
+
+```
+
+# EDA
+
+## Modify to insert additional columns into data
+
+```{r}
+new_column <- data.frame(patient=1:136)
+data <- cbind(new_column, data)
+head(data)
+```
+
+## Convert categorical variables to factors and assign level names
+
+```{r}
+data$Treatment <- factor(data$Treatment, levels= c(1,2), labels=c(":Standard",":Test"))
+data$Celltype <- factor(data$Celltype, levels=c(1,2,3,4), labels =c(":squamous",":smallcell",":adeno",":large"))
+data$Prior_T <- factor(data$Prior_T,levels=c(0,10),labels=c(":none",":yes"))
+```
+
+```{r}
+table(data$Treatment)
+```
+
+In this study, 9 patients are censored, 127/136 patients had death events during the study.
+
+# Kaplan-Meier curves
+
+## **Kaplan-Meier curve for the whole dataset**
+
+```{r}
+library(survival)
+fit.surv <- survfit(Surv(data$time,data$Status)~1)
+plot(fit.surv,xlab= "Time (in days)",ylab="Estimated probability of survival")
+```
+
+## **Kaplan-Meier curve stratified by treatment type**
+
+```{r}
+fit.treatment <- survfit(Surv(data$time,data$Status)~data$Treatment)
+plot(fit.treatment,xlab= "Time (in days)",ylab="Estimated probability of survival",col=c(2,4))
+x_factor <- factor(x, levels = c(1, 2), labels = c("Treatment= Standard", "Treatment= Test"))
+legend("topright",legend=levels(x_factor), col=c(2,4),lty=1)
+```
+
+**Log-rank test to compare survival times of standard to test treatments**
+
+```{r}
+logrank.test <- survdiff(Surv(data$time,data$Status)~data$Treatment)
+logrank.test
+```
+
+Since p-value is 0.9, it seems like there is no significant difference between the two treatment types.
+
+Unfortunately, the results are inconclusive, because the difference between the two estimated survival functions is too small to confidently argue that the drug affects survival or not.
+
+## **Kaplan-Meier curve stratified by cell type**
+
+```{r}
+fit.celltype <- survfit(Surv(data$time,data$Status)~data$Celltype)
+plot(fit.celltype,xlab= "Time (in days)",ylab="Estimated probability of survival",col=c(1,2,3,4))
+legend("topright",legend=levels(data$Celltype), col=c(1,2,3,4),lty=1)
+```
+
+In this case, we observe a pronounced difference between two groups. Patients with *squamous* or *large* cells seem to have a better prognosis compared to patients with *small* or *adeno* cells.
+
+# Cox-Proportional hazards model
+
+Next, we fit Cox proportional hazards models using the coxph () function. We use all possible predictors in the model. This method is used to estimate the impact of each predictor on survival, while other variables are held fixed.
+
+```{r}
+fit.cox1 <- coxph(Surv(data$time,data$Status)~data$Treatment+ data$Celltype + data$K_score + data$Diag + data$Age + data$Prior_T)
+summary(fit.cox1)
+```
+
+Interpretations w.r.t each significant predictor:
+
+**Celltype**: small cell : At a given instant in time, the probability of dying for someone with Small cell carcinoma is 2.47 times ( 147% more likely) as likely as someone with squamous carcinoma, adjusting for all other predictors. adeno: 3.44 times (244% more likely), large: 1.54 times (54% more likely)
+
+**K-Score**: At a given instant in time, if KI increases by one unit, the hazard ratio (or likelihood of dying) decreases by (1-0.9676) = 0.0324 or 3.24%
+
+Now let's fit another Cox-Proportional model by dropping treatment type as one of the predictors in the model.
+
+```{r}
+fit.cox2 <- coxph(Surv(data$time,data$Status)~data$Celltype + data$K_score + data$Diag + data$Age + data$Prior_T)
+summary(fit.cox2)
+```
+
+```{r}
+anova(fit.cox2,fit.cox1,test = "LRT")
+```
+
+The cox models are not significantly different from each other. Hence, treatment type has no effect on the survival.
+
+## Predicting patient specific Survival functions ?
+
+Finally, we plot survival curves for each diagnosis category, adjusting for the other predictors. To make these plots, we set the values of the other predictors equal to the mean for quantitative variables, and the modal value for factors. We first create a data frame with four rows, one for each level of diagnosis.
+
+```{r}
+new <- data.frame(
+  Treatment= c(0,0,0,0),
+  Celltype = c(1,2,3,4),
+  Age = rep(mean(data$Age),4),
+  K_score= rep(mean(data$K_score), 4),
+  Diag = rep(1,4),
+  Prior_T = c(0,0,0,0)
+)
+plot(survfit(fit.cox1,newdata=new))
+#plot(survfit(fit.cox1, data = new),xlab="Months",ylab="Survival Probability",col=c(1,2,3,4))
+#plot(survplots,xlab="Months",ylab="Survival Probability",col=c(1,2,3,4))
+```
+
+## Feature Selection: Which Variable is Most Predictive?
+
+\
+The model above considered all available variables for prediction. Next, we want to investigate which single variable is the best risk predictor. Therefore, we fit a Cox model to each variable individually and record the c-index on the training set.
+
+```{r}
+fittest.cox1 <- coxph(Surv(data$time,data$Status)~data$Treatment)
+fittest.cox2 <- coxph(Surv(data$time,data$Status)~data$Celltype)
+fittest.cox3 <- coxph(Surv(data$time,data$Status)~data$K_score)
+fittest.cox4 <- coxph(Surv(data$time,data$Status)~data$Diag)
+fittest.cox5 <- coxph(Surv(data$time,data$Status)~data$Age)
+fittest.cox6 <- coxph(Surv(data$time,data$Status)~data$Prior_T)
+
+models <- list(fittest.cox1, fittest.cox2, fittest.cox3, fittest.cox4, fittest.cox5, fittest.cox6)
+
+# Display concordance indices for all models in a table
+concordance_table <- data.frame(
+  Model = 1:6,
+  Concordance = unlist(lapply(models, function(model) survival::survConcordance(model)$concordance))
+)
+
+
+```
+
+From the c-indices, Karnofsky_score is the best predictive feature of survival. Months from diagnosis and Age have very insignificant predictive power.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+data_status <- data %>%
+  group_by(Status) %>%
+  summarize(n = n_distinct(patient))
+
+data_new <- data %>%
+  group_by(time) %>%
+  summarize(n = n_distinct(patient))
+ print(data_status)
+
+```
+
+Interpretation: Looks like most patients (127) died during the study, only 9 patients have censored data.
+
+# Uni-variate Analyses
+
+```{r}
+col_new <- c("Celltype", "time","Status","K_score","Diag","Age", "Treatment")
+# Loop through each column in the dataframe
+for (col in col_new) {
+  # Create a ggplot object for the current column
+  p <- ggplot(data, aes_string(x = col)) +
+    geom_histogram(fill = "lightblue", color = "black") + # You can choose a different plot type here
+    labs(title = paste("Univariate Plot for", col))
+  
+  # Print the plot
+  print(p)
+}
+
+```
+
+Interpretation:
+
+1.  Patients with small cell involved are higher than other cell types.
+2.  Survival time seems to be centered around \~200 days for most patients. Right skewed distribution.
+3.  Most patients died during the study.
+4.  Most patients were diagnosed early. (\<20 months)
+5.  There are high number of older patients (60-70) than young people in the study.
+
+# Bivariate Analyses
+
+```{r}
+plot(data$time,data$Age)
+plot(data$Age,data$Diag)
+plot(data$time,data$Diag)
+plot(data$Celltype,data$Age)
+plot(data$time,data$Celltype)
+boxplot(data$K_score~data$Celltype)
+boxplot(data$K_score~data$Celltype)
+```
+
+Interpretations:
+
+1.  Majority of old people (60-70) died early.
+2.  Patients with cell type 2 seem to have the least survival time.
+3.  Celltype 2 is observed across patients in all ages.
+
+# Kaplan-Meier curve
+
+```{r}
+library(survival)
+library(survminer)
+surv_fit <- survfit(Surv(data$time,data$Status)~1)
+ggsurvplot(surv_fit,data=data)
+```
+
+Seems like most patients died in \~200 days, as there is a steep drop in survival probability.
+
+# Does the type of drug (treatment) affect survival?
+
+```{r}
+
+# Create a survival object with the time-to-event variable and the status variable
+surv_obj <- Surv(data$time, data$Status)
+
+# Fit Kaplan-Meier survival curves stratified by treatment types
+surv_fit2 <- survfit(surv_obj ~ data$Treatment)
+#summary(surv_fit2)
+# Plot the survival curves
+ggsurvplot(surv_fit2,data=data,pval=TRUE)
+fit2 <- survdiff(Surv(data$time, data$Status)~data$Treatment)
+print(fit2)
+```
+
+The two survival functions do not seem to have significant difference. The drug type does not affect survival.
+
+# Does the celltype affect survival?
+
+```{r}
+library(survMisc)
+# Create a survival object with the time-to-event variable and the status variable
+surv_obj <- Surv(data$time, data$Status)
+
+# Fit Kaplan-Meier survival curves stratified by treatment types
+surv_fit3 <- survfit(surv_obj ~ data$Celltype)
+# Plot the survival curves
+ggsurvplot(surv_fit3,data=data,pval=TRUE)
+
+#Compute differences in significance
+fit3 <- survdiff(Surv(data$time, data$Status)~data$Celltype)
+print(fit3)
+pairwise <- pairwise_survdiff(Surv(time, Status) ~ Celltype,data=data)
+print(pairwise)
+#symnum(pairwise$p.value,cutpoints = c(0,0.001,0.01,0.05,1),symbols = c("****", "***", "**", "*"))
+```
